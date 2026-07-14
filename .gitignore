@@ -3,6 +3,10 @@ c/mio_env/
 __pycache__/
 **/__pycache__/
 *.pyc
+
+# modelli / artefatti locali (non committare)
+models/
+nohup.out
 web/node_modules/
 web/dist/
 web/*.tsbuildinfo
