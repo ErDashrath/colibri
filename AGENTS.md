@@ -85,6 +85,23 @@ for schema compatibility.
 
 ## 4. Changelog
 
+### v1.1.1 — 2026-07-14 — HIP decode tuning (CUDA_DENSE)
+- **`coli` no longer force-enables `CUDA_DENSE=1` for the HIP backend.** On AMD
+  APUs (unified memory), putting resident dense matmuls on the GPU adds a
+  per-call H2D/D2H/sync tax that makes the GPU slower than the fast Zen CPU for
+  single-token decode. Measured ~2× faster decode with dense on CPU
+  (161–196s → 90–106s; attention 10.5→4.0s, expert-matmul 19–27→12s). The CUDA
+  backend still defaults `CUDA_DENSE=1` (helps on dGPUs); HIP uses the engine
+  default (0). Override with `CUDA_DENSE=1/0`.
+- The GPU's correct role on this APU is the **expert tier only** (grouped /
+  batched). Confirmed via `COLI_CUDA_PROFILE`: single-token decode is CPU +
+  disk bound (`expert-disk` service dominates, `wait≈0` — I/O already
+  overlapped via the PIPE thread pool + readahead).
+- Investigated and **rejected** two Tier-1 candidates (documented in
+  `docs/HIP-PERF-REVIEW.md`): fusing the shared expert (A) — no benefit (shared
+  expert is tiny, ~6 MB/triple); attention on GPU (B) — no benefit (GPU kernel
+  slower than CPU for decode). Both leave `glm.c` unchanged.
+
 ### v1.1.0 — 2026-07-14 — ROCm/HIP backend
 - **New HIP backend** (`c/backend_hip.cpp`): faithful 1:1 port of
   `backend_cuda.cu` — general WxA32 GEMM, fused expert MLP, grouped expert

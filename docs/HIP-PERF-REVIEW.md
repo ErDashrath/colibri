@@ -18,9 +18,20 @@ the real CPU/GPU bottleneck**, not disk (disk service overlaps; wait≈0).
 
 ## What "other" contains
 
-`other = elapsed - (ewait + emm + attn + head)`. The buckets `t_emm` (routed
-expert matmuls) and `t_attn` (MLA: q_a/q_b/kv_a/kv_b/o + RoPE + softmax + value)
-are instrumented. **Uninstrumented** GPU work falls into "other":
+**Correction (measured 2026-07-14):** `other` is **almost entirely disk-I/O
+overlap**, NOT shared-expert sync. In a controlled A/B (`COLI_CUDA_FUSE_MLP=1` vs
+`=0`, same warm cache), `other − expert-disk` was **~7s in both runs** — i.e. the
+non-disk portion of "other" is small and unchanged by fusing the shared expert.
+`other ≈ expert-disk service` because disk service overlaps wall time but is not
+in `accounted = ewait + emm + attn + head`.
+
+The shared expert is small (sI = `moe_intermediate × n_shared` = 2048 × 1 →
+~6 MB weights/triple) and runs resident (no disk). Its 3→1 fusion saves <0.5s
+total — invisible in the noise. **Item A (fuse shared expert) was measured to
+have no benefit and reverted.** The real non-disk costs are `expert-matmul`
+(routed experts, grouped) and `attention` (CPU by default).
+
+The uninstrumented GPU work in "other" is:
 
 - **Shared expert** (`glm.c:2074-2080`): 3 separate `matmul_qt` calls per layer
   (`sh_gate`, `sh_up`, `sh_down`) → 78 layers × 3 = **234 synchronous
@@ -53,31 +64,39 @@ actionable HIP part of "other".
 
 ### Tier 1 — high impact, low/medium effort
 
-#### A. Fuse shared-expert + dense MLP through `coli_cuda_expert_mlp`
-Wire `sh_gate/sh_up/sh_down` (and `gate_proj/up_proj/down_proj`) into one fused
-GPU call when all three are `cuda_eligible`. Shapes already satisfy the
-contract: shared expert is `sh_gate[2048,6144]`, `sh_up[2048,6144]`,
-`sh_down[6144,2048]` → `down->I(2048)==gate->O(2048)`,
-`down->O(6144)==gate->I(6144)`. ✓
+#### A. ~~Fuse shared-expert + dense MLP through `coli_cuda_expert_mlp`~~ (REVERTED — no benefit)
+Measured A/B (`COLI_CUDA_FUSE_MLP=1` vs `0`, warm cache, 12 tokens): wall
+215s vs 190s (disk noise), `other − disk` identical (~7s) in both. The shared
+expert is tiny (~6 MB/triple, resident) so 3→1 fusion saves <0.5s. "other" is
+disk overlap, not shared-expert sync. **Reverted; glm.c unchanged.**
 
-**Win:** 3→1 round-trips per layer, SiLU moves to GPU, `x` uploaded once instead
-of 3×. ~156 fewer syncs/token. Cleanest attack on "other". ~30 lines of host
-glue in the shared-expert block and `dense_mlp`. Low risk: `coli_cuda_expert_mlp`
-is already unit-tested.
+#### B. ~~Enable `COLI_CUDA_ATTN` for HIP~~ (NO BENEFIT — not enabled)
+Measured A/B (`COLI_CUDA_ATTN=1` vs `0`, warm): attention bucket ~10s either
+way (swamped by disk variance). The GPU attention kernel (H=64 blocks, serial
+softmax, per-call H2D/D2H/sync) cannot beat the fast Zen5 CPU for single-token
+decode — the score-softmax-value core was ~1.7s on GPU vs ~0.5–2s on CPU.
+**Left off by default; attention stays on CPU.** Not worth a kernel rework: the
+bucket is ~5–10s vs ~80–155s disk.
 
-**Code touch points:** `glm.c:2074-2080` (shared expert), `glm.c:2086`
-(`dense_mlp`), behind `#ifdef COLI_CUDA` with `cuda_eligible` guards + fallback
-to the existing 3× `matmul_qt`.
+### Tier 0 — the actual win (implemented)
 
-#### B. Enable `COLI_CUDA_ATTN` for HIP + raise attention kernel occupancy
-Move ~15.6s of attention off the CPU. Then fix the kernel
-(`backend_hip.cpp` `attention_absorb_kernel`):
-- (a) **Parallel softmax** — replace the one-thread loop over T with a warp
-  shuffle reduction (T≤4096 → a few warps).
-- (b) **More blocks** — grid is only `H`=64; split the T (or K) dimension across
-  blocks so 40 CUs are fed (currently ~1.6 blocks/CU → severe underfill).
+#### ★ `CUDA_DENSE=0` for HIP: don't put dense matmuls on the GPU
+The engine default is `CUDA_DENSE=0` (dense on CPU), but the `coli` launcher
+force-set `CUDA_DENSE=1` whenever `--gpu` was passed. On this APU that **hurts**:
+per-call H2D/D2H/sync on unified memory makes the GPU slower than the Zen5 CPU
+for small decode matmuls. Measured (warm, 12 tokens):
 
-**Win:** attention goes GPU-side and actually uses the GPU. Medium effort.
+| config | wall | attention | expert-matmul | lm_head |
+|---|---|---|---|---|
+| `CUDA_DENSE=1` (dense GPU) | 161–196s | 10.5s | 19–27s | 0.5–0.9s |
+| `CUDA_DENSE=0` (dense CPU) | **90–106s** | **4.0s** | **12.1s** | **0.14s** |
+
+~2× faster. **Fix:** `coli` now defaults `CUDA_DENSE=1` only for the CUDA
+backend (`gpu_backend()=="cuda"`); for HIP it leaves the engine default (0).
+Users can override with `CUDA_DENSE=1` (e.g. AMD dGPUs with fast VRAM may want
+it). The GPU's correct role on this APU is the **expert tier only** (grouped /
+batched), matching the README's finding that the GPU "buys ≈0%" on small decode
+matmuls when the CPU is fast.
 
 ### Tier 2 — medium impact
 
@@ -120,15 +139,17 @@ forward to hold device buffers and push layernorms/router to the GPU.
 
 ## Recommended next steps
 
-1. **Implement A** (fuse shared expert + dense MLP via `coli_cuda_expert_mlp`).
-   Smallest, lowest-risk change that directly removes the largest chunk of
-   "other".
-2. **Implement B** (enable `COLI_CUDA_ATTN` + parallel softmax + more blocks).
-   Removes the 15.6s attention bucket from the CPU.
-3. Re-measure with `COLI_CUDA_PROFILE=1` and compare "other" / "attention" /
-   wall time.
-4. Only then consider **C/D** (micro-kernel opts) and **E/F** (tensor cores /
-   on-device activation chain), which are higher-effort.
+1. ✅ **`CUDA_DENSE=0` for HIP** (the real win, ~2× faster on APU) — implemented in
+   `coli`.
+2. ~~Fuse shared expert (A)~~ — measured no benefit; reverted.
+3. ~~Attention on GPU (B)~~ — measured no benefit; left on CPU.
+4. The remaining wall time is **disk-I/O-bound** (80–155s expert-disk). The GPU
+   can't help; raise the expert hit rate (more `--ram`, more usage history → more
+   pinning, `--topp 0.7`). On this APU + fast Zen5 CPU, single-token decode is
+   CPU+disk bound, not GPU-compute bound.
+5. If a GPU-compute win is still wanted: **item E (rocWMMA tensor cores)** for the
+   grouped expert matmul (12s bucket) is the only remaining GPU lever — but it's
+   small vs disk, and high effort.
 
 ## Non-GPU note (context, not HIP scope)
 

@@ -178,7 +178,14 @@ def env_for(a):
                     sys.exit(f"{C.yel}--gpu needs a GPU build:{C.r} make glm CUDA=1  (NVIDIA)  or  make glm HIP=1  (AMD ROCm)\n        this binary is CPU-only")
                 e["COLI_CUDA"]="1"
                 if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
-                e.setdefault("CUDA_DENSE","1")
+                # CUDA_DENSE=1 (resident dense tensors on GPU) helps on NVIDIA dGPUs
+                # but HURTS on AMD APUs: the per-call H2D/D2H/sync tax on unified
+                # memory makes the GPU slower than a fast Zen CPU for small decode
+                # matmuls (measured: 161s -> 90s with it off). Default it on only
+                # for the CUDA backend; leave the engine default (0) for HIP. Override
+                # explicitly with CUDA_DENSE=1/0.
+                if gpu_backend()=="cuda":
+                    e.setdefault("CUDA_DENSE","1")
         if a.vram and a.gpu!="none":
             if not cuda_binary():
                 sys.exit(f"{C.yel}--vram needs a GPU build:{C.r} make glm CUDA=1  (NVIDIA)  or  make glm HIP=1  (AMD ROCm)\n        this binary is CPU-only")
