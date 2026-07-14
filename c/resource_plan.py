@@ -120,24 +120,57 @@ def memory_available():
 
 
 def discover_gpus():
+    # NVIDIA path.
     command = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
                "--format=csv,noheader,nounits"]
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is not None:
+        devices = []
+        for line in result.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",", 3)]
+            if len(fields) != 4:
+                continue
+            try:
+                index, total, free = int(fields[0]), int(fields[2]), int(fields[3])
+            except ValueError:
+                continue
+            devices.append({"index": index, "name": fields[1],
+                            "total_bytes": total * 1024 * 1024,
+                            "free_bytes": free * 1024 * 1024})
+        if devices or shutil.which("nvidia-smi"):
+            return devices
+
+    # AMD ROCm path. rocm-smi --showmeminfo vram prints per-GPU VRAM in bytes;
+    # --showproductname gives the marketing name. Parse them together by index.
+    if not shutil.which("rocm-smi"):
         return []
     devices = []
-    for line in result.stdout.splitlines():
-        fields = [field.strip() for field in line.split(",", 3)]
-        if len(fields) != 4:
+    try:
+        mem = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
+                             text=True, capture_output=True, check=True, timeout=5)
+        names = subprocess.run(["rocm-smi", "--showproductname", "--json"],
+                               text=True, capture_output=True, check=True, timeout=5)
+        mem_data = json.loads(mem.stdout or "{}")
+        name_data = json.loads(names.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+    for key, info in mem_data.items():
+        # keys look like "card0"; only GPU cards have a VRAM entry.
+        m = re.match(r"card(\d+)$", key)
+        if not m:
             continue
-        try:
-            index, total, free = int(fields[0]), int(fields[2]), int(fields[3])
-        except ValueError:
-            continue
-        devices.append({"index": index, "name": fields[1],
-                        "total_bytes": total * 1024 * 1024,
-                        "free_bytes": free * 1024 * 1024})
+        index = int(m.group(1))
+        total = int(info.get("VRAM Total Memory (B)", 0))
+        free = int(info.get("VRAM Total Used Memory (B)", 0))
+        name = "GPU"
+        np = name_data.get(key, {})
+        if isinstance(np, dict):
+            name = np.get("Marketing Name") or np.get("Card Series") or "GPU"
+        devices.append({"index": index, "name": name,
+                        "total_bytes": total, "free_bytes": max(0, total - free)})
     return devices
 
 

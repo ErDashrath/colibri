@@ -1,4 +1,10 @@
 *.exe
+backend_hip.o
+backend_hip_test
+backend_cuda.o
+backend_cuda_test
+backend_cuda_bench
+tests/test_backend_hip.o
 glm_tiny/
 olmoe_hf/
 olmoe_i4/

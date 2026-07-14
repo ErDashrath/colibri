@@ -92,6 +92,20 @@ PYTHON    ?= python3
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
 
+# HIP=1 adds an opt-in ROCm/HIP backend (Linux). It exports the SAME
+# coli_cuda_* ABI as backend_cuda.o, so glm.c is built with -DCOLI_CUDA and
+# links backend_hip.o (compiled by hipcc) instead of the CUDA backend. No host
+# code changes; COLI_CUDA=1 / COLI_GPU=0 / CUDA_DENSE=1 / CUDA_EXPERT_GB=... work
+# unchanged. See docs/HIP-PORT-PLAN.md. Mutually exclusive with CUDA=1/CUDA_DLL=1.
+HIP       ?= 0
+HIPCC     ?= /opt/rocm/bin/hipcc
+HIP_HOME  ?= /opt/rocm
+HIP_ARCH  ?= native
+HIPFLAGS  ?= -O3 -std=c++17 --offload-arch=$(HIP_ARCH) -fno-gpu-rdc
+# Host-side flags for compiling HIP-API users (the test) with gcc. glm.c never
+# includes hip_runtime.h (it only sees backend_cuda.h), so it needs none of these.
+HIPHOST   ?= -D__HIP_PLATFORM_AMD__ -I$(HIP_HOME)/include
+
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
@@ -109,9 +123,30 @@ ifneq ($(IS_WIN),)
 # On Windows use CUDA_DLL=1 (runtime DLL), not CUDA=1 (direct link).
 $(error On Windows use: make CUDA_DLL=1 cuda-dll  (see backend_loader.c))
 endif
+ifeq ($(HIP),1)
+$(error CUDA=1 and HIP=1 are mutually exclusive)
+endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
+endif
+
+# Linux ROCm/HIP direct-link path. backend_hip.cpp exports the same
+# coli_cuda_* symbols as backend_cuda.cu, so glm.c's -DCOLI_CUDA integration is
+# reused verbatim; only the linked object differs.
+ifeq ($(HIP),1)
+ifeq ($(UNAME_S),Darwin)
+$(error HIP=1 is supported only on Linux)
+endif
+ifneq ($(IS_WIN),)
+$(error HIP=1 is supported only on Linux for now)
+endif
+ifeq ($(CUDA),1)
+$(error CUDA=1 and HIP=1 are mutually exclusive)
+endif
+CFLAGS   += -DCOLI_CUDA
+LDFLAGS  += -L$(HIP_HOME)/lib -Wl,-rpath,$(HIP_HOME)/lib -lamdhip64 -lstdc++
+CUDA_OBJ  = backend_hip.o
 endif
 
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
@@ -156,6 +191,12 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
+# ROCm/HIP backend object. hipcc embeds device code in a normal relocatable .o
+# that links cleanly into the gcc-built glm via -lamdhip64 -lstdc++.
+backend_hip.o: backend_hip.cpp backend_cuda.h
+	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: set HIPCC" >&2; exit 1; }
+	$(HIPCC) $(HIPFLAGS) -c backend_hip.cpp -o $@
+
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
@@ -172,6 +213,18 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
+
+hip-test: backend_hip.cpp backend_cuda.h tests/test_backend_hip.cpp
+	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: set HIPCC" >&2; exit 1; }
+	# Device code (kernels) is compiled by hipcc -c; the test (host-only) by
+	# gcc. We link with gcc + -lamdhip64: on some toolchains hipcc's own link
+	# driver mishandles the runtime's static init, whereas a gcc-linked binary
+	# initialises libamdhip64 cleanly (same as llama.cpp's ROCm build).
+	$(HIPCC) $(HIPFLAGS) -c backend_hip.cpp -o backend_hip.o
+	$(CC) -O2 -std=c++17 $(HIPHOST) -c tests/test_backend_hip.cpp -o tests/test_backend_hip.o
+	$(CC) -O2 -std=c++17 backend_hip.o tests/test_backend_hip.o -o backend_hip_test$(EXE) \
+		-L$(HIP_HOME)/lib -Wl,-rpath,$(HIP_HOME)/lib -lamdhip64 -lstdc++ -lm
+	./backend_hip_test$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
@@ -219,7 +272,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_hip.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_hip_test$(EXE) tests/test_backend_hip.o backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
+.PHONY: all glm cuda-test cuda-bench cuda-dll hip-test portable test-c test-python test check clean

@@ -81,7 +81,7 @@ def sprite_lines():
 def banner(sub=""):
     sp=sprite_lines()
     txt=[
-        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.0{C.r}",
+        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.1{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
         f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
@@ -106,13 +106,23 @@ def need_model(model):
     if not os.path.exists(GLM):
         sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
 
-def cuda_binary():
-    if not os.path.exists(GLM) or sys.platform != "linux": return False
+# The resident-GPU backend links against libcudart (CUDA) or libamdhip64 (HIP).
+# Both export the same coli_cuda_* ABI, so from the launcher's point of view they
+# are interchangeable: any GPU-linked binary can serve --gpu/--vram.
+def gpu_backend():
+    """Return 'cuda', 'hip', or None for the built engine (None = CPU-only)."""
+    if not os.path.exists(GLM) or sys.platform != "linux": return None
     try:
         linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
-        return any("libcudart" in line and "not found" not in line
-                   for line in linked.stdout.splitlines())
-    except (OSError,subprocess.SubprocessError): return False
+    except (OSError,subprocess.SubprocessError): return None
+    for line in linked.stdout.splitlines():
+        if "not found" in line: continue
+        if "libcudart" in line: return "cuda"
+        if "libamdhip64" in line: return "hip"
+    return None
+
+def cuda_binary():
+    return gpu_backend() is not None
 
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
@@ -165,13 +175,13 @@ def env_for(a):
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
-                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                    sys.exit(f"{C.yel}--gpu needs a GPU build:{C.r} make glm CUDA=1  (NVIDIA)  or  make glm HIP=1  (AMD ROCm)\n        this binary is CPU-only")
                 e["COLI_CUDA"]="1"
                 if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
                 e.setdefault("CUDA_DENSE","1")
         if a.vram and a.gpu!="none":
             if not cuda_binary():
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                sys.exit(f"{C.yel}--vram needs a GPU build:{C.r} make glm CUDA=1  (NVIDIA)  or  make glm HIP=1  (AMD ROCm)\n        this binary is CPU-only")
             e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
@@ -302,7 +312,12 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
-    sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
+    target=[]
+    if getattr(a,"hip",False) or os.environ.get("COLI_HIP"):
+        target=["HIP=1"]
+    elif getattr(a,"cuda",False) or os.environ.get("COLI_CUDA_BUILD"):
+        target=["CUDA=1"]
+    sys.exit(subprocess.call(["make","-C",HERE]+target+["glm"]))
 
 def cmd_info(a):
     banner("info")
@@ -568,7 +583,11 @@ def main():
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
     sub=ap.add_subparsers(dest="cmd")
-    sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
+    # build-only backend selectors (default: pure-C CPU build)
+    build_p=sub.add_parser("build", parents=[common])
+    build_p.add_argument("--hip", action="store_true", help="build the AMD ROCm/HIP GPU backend (make HIP=1)")
+    build_p.add_argument("--cuda", action="store_true", help="build the NVIDIA CUDA GPU backend (make CUDA=1)")
+    sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
     pd=sub.add_parser("doctor",parents=[common])

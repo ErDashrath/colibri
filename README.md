@@ -11,7 +11,7 @@ router semantics.
 
 ```
 $ ./coli chat
-  🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibrì v1.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -403,6 +403,49 @@ python tools/benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 
 The fixture has random weights and is not a language model. It exists only to
 preserve the real MLA/MoE/streaming shapes and compare CPU streaming, dense-only
 CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
+
+### Experimental ROCm/HIP backend (AMD GPUs)
+
+colibrì includes an opt-in **ROCm/HIP** backend that is a port of the CUDA
+backend to AMD GPUs. It exports the *same* `coli_cuda_*` ABI as
+`backend_cuda.o`, so `glm.c` is built with `-DCOLI_CUDA` and links
+`backend_hip.o` (compiled by `hipcc`) instead of the CUDA object — **no host
+engine code changes**, and the `COLI_CUDA=1` / `COLI_GPU=0` / `CUDA_DENSE=1` /
+`CUDA_EXPERT_GB=…` / `COLI_CUDA_ATTN=1` / `COLI_CUDA_PROFILE=1` variables work
+unchanged. (The `cuda` in the symbol names is a historical label for "the
+resident-GPU backend".) Full design notes and the API mapping are in
+[`docs/HIP-PORT-PLAN.md`](docs/HIP-PORT-PLAN.md); the code review is in
+[`docs/CODE-REVIEW.md`](docs/CODE-REVIEW.md).
+
+```bash
+cd c
+make hip-test                       # q8/q4/q2/f32 + expert-group + attention correctness
+make HIP=1                          # build glm linked against libamdhip64
+COLI_CUDA=1 COLI_GPU=0 CUDA_DENSE=1 SNAP=/path/to/glm52_i4 ./glm 64 4 4
+```
+
+Requirements: Linux, a working AMD GPU driver + ROCm under `/opt/rocm`
+(override with `HIP_HOME=/path/to/rocm` and `HIPCC=/path/to/hipcc`).
+`HIP_ARCH=native` makes `hipcc` auto-detect the installed GPU (e.g. `gfx1151`);
+set `HIP_ARCH=gfx1100` to cross-compile. `HIP=1` is mutually exclusive with
+`CUDA=1`/`CUDA_DLL=1`.
+
+**Build note:** device kernels are compiled by `hipcc -c` into `backend_hip.o`,
+then linked into the gcc-built `glm` with `-lamdhip64 -lstdc++` (the same
+linking strategy llama.cpp's ROCm build uses). This gcc-link path is required on
+some toolchains where hipcc's own link driver mishandles the HIP runtime's static
+initialisation.
+
+**Capability gap vs CUDA:** the int4 **tensor-core** (WMMA) expert path
+(`COLI_CUDA_TC_INT4`, opt-in and off by default on CUDA) is NVIDIA-only — it uses
+`nvcuda::wmma` s4 fragments with no header-level HIP equivalent. On HIP the
+production **W4A32 packed path** (`grouped_hidden_w4_dual` / `grouped_down_w4`,
+FP32 activations × signed-int4 weights) is always used instead; it is the CUDA
+default too. `COLI_CUDA_TC_INT4` is accepted but logged as ignored on HIP. A
+future rocWMMA implementation can fill this gap behind the same flag. Everything
+else — the general WxA32 GEMM, fused expert MLP, grouped expert dispatch with
+async pinned staging + profiling, the MLA weight-absorption attention core, and
+the int4 `0x88` offset→signed conversion at upload — is a faithful 1:1 port.
 
 ### Web interface
 
