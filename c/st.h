@@ -200,6 +200,9 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
 static int64_t st_numel(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->numel : -1;
 }
+static int st_dtype(shards *S, const char *name) {
+    st_tensor *t = st_find(S, name); return t ? t->dtype : -1;
+}
 static int64_t st_nbytes(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
 }
