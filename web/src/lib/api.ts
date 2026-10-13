@@ -80,6 +80,61 @@ export async function getHealth(baseUrl: string, apiKey = "", signal?: AbortSign
   return (await response.json()) as HealthResponse
 }
 
+export interface VoiceInfo {
+  id: string
+  name: string
+  lang: string
+}
+
+export async function listVoices(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<VoiceInfo[]> {
+  try {
+    const response = await fetch(endpoint(baseUrl, "audio/voices"), { headers: headers(apiKey), signal })
+    if (!response.ok) return [{ id: "local", name: "Piper Lessac (Local Offline)", lang: "en-US" }]
+    const data = (await response.json()) as { voices?: VoiceInfo[] }
+    return data.voices || [{ id: "local", name: "Piper Lessac (Local Offline)", lang: "en-US" }]
+  } catch {
+    return [{ id: "local", name: "Piper Lessac (Local Offline)", lang: "en-US" }]
+  }
+}
+
+export async function transcribeAudio(
+  baseUrl: string,
+  apiKey: string,
+  audioBlob: Blob,
+  filename = "speech.webm",
+): Promise<string> {
+  const formData = new FormData()
+  formData.append("file", audioBlob, filename)
+
+  const response = await fetch(endpoint(baseUrl, "audio/transcriptions"), {
+    method: "POST",
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    body: formData,
+  })
+  if (!response.ok) throw new Error(await responseError(response))
+  const data = (await response.json()) as { text?: string }
+  return data.text || ""
+}
+
+export async function synthesizeSpeech(
+  baseUrl: string,
+  apiKey: string,
+  text: string,
+  voice = "local",
+): Promise<Blob> {
+  const response = await fetch(endpoint(baseUrl, "audio/speech"), {
+    method: "POST",
+    headers: headers(apiKey),
+    body: JSON.stringify({
+      model: "tts-1",
+      input: text,
+      voice,
+    }),
+  })
+  if (!response.ok) throw new Error(await responseError(response))
+  return await response.blob()
+}
+
 export function extractSSE(buffer: string) {
   const frames = buffer.split(/\r?\n\r?\n/)
   const rest = frames.pop() || ""
@@ -130,8 +185,12 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
 
+  let isDone = false
   const consume = (data: string) => {
-    if (data === "[DONE]") return
+    if (data === "[DONE]") {
+      isDone = true
+      return
+    }
     const event = JSON.parse(data) as {
       choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
@@ -149,7 +208,10 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     const parsed = extractSSE(buffer)
     buffer = parsed.rest
     parsed.data.forEach(consume)
-    if (done) break
+    if (done || isDone) {
+      try { void reader.cancel() } catch { /* ignore */ }
+      break
+    }
   }
 
   const queueWaitHeader = response.headers.get("x-colibri-queue-wait-ms")
