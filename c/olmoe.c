@@ -15,6 +15,7 @@
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #endif
+#include <omp.h>
 #include "st.h"
 
 /* ---------- config ---------- */
@@ -53,6 +54,68 @@ typedef struct {
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+#include <immintrin.h>
+
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float dot_f32_avx2(const float *a, const float *b, int n) {
+    int i = 0;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m256 va0 = _mm256_loadu_ps(a + i);
+        __m256 vb0 = _mm256_loadu_ps(b + i);
+        acc0 = _mm256_fmadd_ps(va0, vb0, acc0);
+
+        __m256 va1 = _mm256_loadu_ps(a + i + 8);
+        __m256 vb1 = _mm256_loadu_ps(b + i + 8);
+        acc1 = _mm256_fmadd_ps(va1, vb1, acc1);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        acc0 = _mm256_fmadd_ps(va, vb, acc0);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float sum = _mm_cvtss_f32(s);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+static inline float dot_q8f_avx2(const float *x, const int8_t *q, int n) {
+    int i = 0;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m128i raw = _mm_loadu_si128((const __m128i*)(q + i));
+        __m256i lo32 = _mm256_cvtepi8_epi32(raw);
+        __m128i raw_hi = _mm_srli_si128(raw, 8);
+        __m256i hi32 = _mm256_cvtepi8_epi32(raw_hi);
+
+        __m256 qf0 = _mm256_cvtepi32_ps(lo32);
+        __m256 qf1 = _mm256_cvtepi32_ps(hi32);
+
+        __m256 x0 = _mm256_loadu_ps(x + i);
+        __m256 x1 = _mm256_loadu_ps(x + i + 8);
+
+        acc0 = _mm256_fmadd_ps(x0, qf0, acc0);
+        acc1 = _mm256_fmadd_ps(x1, qf1, acc1);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float sum = _mm_cvtss_f32(s);
+    for (; i < n; i++) sum += x[i] * (float)q[i];
+    return sum;
+}
+#endif
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -61,9 +124,13 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
         const float *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
+#if defined(__AVX2__) && defined(__FMA__)
+            y[(int64_t)s * O + o] = dot_f32_avx2(xs, w, I);
+#else
             float acc = 0.f;
             for (int i = 0; i < I; i++) acc += xs[i] * w[i];
             y[(int64_t)s * O + o] = acc;
+#endif
         }
     }
 }
@@ -74,9 +141,13 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
+#if defined(__AVX2__) && defined(__FMA__)
+        y[o] = dot_q8f_avx2(x, w, I) * scale[o];
+#else
         float acc = 0.f;
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
         y[o] = acc * scale[o];
+#endif
     }
 }
 
@@ -173,6 +244,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 
 /* legge un weight dal disco (streaming) e lo quantizza in q[O,I]+scale[O] */
 static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, int O, int I, float *tmp) {
+    if (st_dtype(&m->S, name) == 3) {
+        char scale_name[256];
+        st_read_raw(&m->S, name, q, 1);
+        snprintf(scale_name, sizeof(scale_name), "%s.qs", name);
+        st_read_f32(&m->S, scale_name, scale, 1);
+        return;
+    }
     st_read_f32(&m->S, name, tmp, 1);            /* pread + fadvise DONTNEED */
     quantize_rows(tmp, q, scale, O, I, m->quant_bits);
 }
@@ -324,8 +402,27 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     return logit;
 }
 
-/* generazione greedy. prompt[np] -> riempie out[np+n_new] */
-static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
+#include <sys/select.h>
+
+static int check_cancelled(int req_id) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(0, &fds);
+    struct timeval tv = {0, 0};
+    if (select(1, &fds, NULL, NULL, &tv) > 0) {
+        char buf[256];
+        if (fgets(buf, sizeof(buf), stdin)) {
+            int cancel_id = 0;
+            if (sscanf(buf, "CANCEL %d", &cancel_id) >= 1) {
+                if (cancel_id == req_id) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* generazione greedy. prompt[np] -> riempie out[np+n_new]. Ritorna il numero di token generati. */
+static int generate(Model *m, int req_id, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
     m->max_t = np + n_new;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
@@ -336,15 +433,30 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);          /* PREFILL */
     int len = np;
+    int gen_count = 0;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         free(logit);
         out[len++] = best;
+        gen_count++;
+        printf("TOKEN %d %d\n", req_id, best);
+        fflush(stdout);
+        if (best == 50279 || best == 0) {  /* EOS tokens */
+            break;
+        }
         if (s == n_new - 1) break;
+        if (check_cancelled(req_id)) {
+            break;
+        }
         int one = best;
         logit = step(m, &one, 1, len - 1);          /* DECODE */
     }
+    for (int i = 0; i < c->n_layers; i++) {
+        free(m->K[i]); free(m->V[i]);
+    }
+    free(m->K); free(m->V);
+    return gen_count;
 }
 
 /* ---------- lettura ref.json ---------- */
@@ -356,15 +468,98 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 int main(int argc, char **argv) {
+    if (!getenv("OMP_NUM_THREADS")) omp_set_num_threads(6);
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
-    int cap  = argc > 1 ? atoi(argv[1]) : 16;
+    int cap  = argc > 1 ? atoi(argv[1]) : 64;
     int bits = argc > 2 ? atoi(argv[2]) : 8;
     if (bits < 2 || bits > 8) {   /* expert storage is int8_t: bits>8 truncates in quantize_rows (#134). f32 mode is not implemented here — int8 is already token-exact vs the oracle. */
         fprintf(stderr, "quant_bits must be 2..8 (got %d); OLMoE experts are int8-backed, no f32 mode\n", bits);
         return 1;
     }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
+
+    printf("== Streaming C engine, cache = %d experts/layer, experts @ %d-bit ==\n", cap, bits);
+    Model m; model_init(&m, snap, cap, bits);
+    printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+
+    int is_server = (strcmp(refpath, "-") == 0);
+    if (is_server || getenv("PRELOAD_EXPERTS") != NULL) {
+        double tp0 = now_s();
+        printf("Preloading all %d experts across %d layers into RAM...\n", m.c.n_experts, m.c.n_layers);
+        fflush(stdout);
+        for (int i = 0; i < m.c.n_layers; i++) {
+            for (int e = 0; e < m.c.n_experts; e++) {
+                Slot *s;
+                expert_get(&m, i, e, &s);
+            }
+        }
+        printf("Preload complete in %.1fs | RAM RSS: %.2f GB (hit=%llu miss=%llu)\n",
+               now_s() - tp0, rss_gb(), (unsigned long long)m.hits, (unsigned long long)m.miss);
+        fflush(stdout);
+    }
+
+    if (is_server) {
+        printf("READY\n");
+        fflush(stdout);
+        char line[65536];
+        while (fgets(line, sizeof(line), stdin)) {
+            char *p = line;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (!*p) continue;
+            if (strncmp(p, "QUIT", 4) == 0) break;
+            if (strncmp(p, "CANCEL", 6) == 0) continue;
+            int req_id = 1;
+            int n_new_req = 128;
+            int np_req = 0;
+            int *prompt_req = NULL;
+            if (*p == '{') {
+                char *arena_req = NULL;
+                jval *req = json_parse(p, &arena_req);
+                if (req) {
+                    prompt_req = read_int_array(req, "prompt_ids", &np_req);
+                    jval *n_val = json_get(req, "n_new");
+                    if (n_val) n_new_req = (int)n_val->num;
+                    jval *r_val = json_get(req, "req_id");
+                    if (r_val) req_id = (int)r_val->num;
+                    free(arena_req);
+                }
+            } else if (strncmp(p, "REQ", 3) == 0) {
+                p += 3;
+                while (*p && isspace((unsigned char)*p)) p++;
+                req_id = (int)strtol(p, &p, 10);
+                while (*p && isspace((unsigned char)*p)) p++;
+                n_new_req = (int)strtol(p, &p, 10);
+                int cap_p = 256;
+                prompt_req = malloc(cap_p * sizeof(int));
+                while (*p) {
+                    while (*p && isspace((unsigned char)*p)) p++;
+                    if (!*p) break;
+                    char *endp = NULL;
+                    long val = strtol(p, &endp, 10);
+                    if (endp == p) break;
+                    p = endp;
+                    if (np_req >= cap_p) { cap_p *= 2; prompt_req = realloc(prompt_req, cap_p * sizeof(int)); }
+                    prompt_req[np_req++] = (int)val;
+                }
+            } else {
+                continue;
+            }
+            if (prompt_req && np_req > 0 && n_new_req > 0) {
+                int *out_req = malloc((np_req + n_new_req) * sizeof(int));
+                int gen_cnt = generate(&m, req_id, prompt_req, np_req, n_new_req, out_req);
+                printf("DONE %d %d\n", req_id, gen_cnt);
+                fflush(stdout);
+                free(out_req);
+                free(prompt_req);
+            } else {
+                printf("DONE %d 0\n", req_id);
+                fflush(stdout);
+                if (prompt_req) free(prompt_req);
+            }
+        }
+        return 0;
+    }
 
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -373,18 +568,14 @@ int main(int argc, char **argv) {
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
     int n_new = nfull - np;
 
-    printf("== Streaming C engine, cache = %d experts/layer, experts @ %d-bit ==\n", cap, bits);
-    Model m; model_init(&m, snap, cap, bits);
-    printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
-
     int *out = malloc((np + n_new) * sizeof(int));
     double t = now_s();
-    generate(&m, prompt, np, n_new, out);
+    int gen_count = generate(&m, 0, prompt, np, n_new, out);
     double dt = now_s() - t;
 
     int match = 0;
     printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
-    printf("\nC engine : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
+    printf("\nC engine : ");  for (int i=np;i<np+gen_count;i++) { printf("%d ", out[i]); if (i < nfull && out[i]==full[i]) match++; }
     printf("\nMatching tokens: %d/%d\n", match, n_new);
     double tot = m.hits + m.miss;
     printf("\nPEAK RSS: %.2f GB\n", rss_gb());
